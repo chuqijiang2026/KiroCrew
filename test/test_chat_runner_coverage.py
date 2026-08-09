@@ -1307,6 +1307,60 @@ class TestSteerLifecycle:
         assert slot._pending_steers == ["b"]
         assert settle.call_args.kwargs["settle_all_on_empty"] is True
 
+    @pytest.mark.asyncio
+    async def test_a_requeued_relay_is_dropped_by_the_drain_not_delivered(
+        self, tmp_path
+    ):
+        """Joins the two halves: requeue marks, drain must FORWARD and refuse.
+
+        Marking and refusing are each covered on their own, and both pass while
+        the drain silently fails to forward the flag -- so this drives the real
+        requeue -> drain path end to end. A mutation removing the keyword argument
+        passed 326 tests before this existed.
+        """
+        from kiro_crew.dashboard.state import SESSION_CONTROL_PREFIX
+
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_steers = [f"{SESSION_CONTROL_PREFIX}relayed text"]
+        chat_runner._requeue_unconsumed_steers(state, slot)
+        assert slot._queue, "the requeue produced nothing to drain"
+
+        with patch.object(
+            chat_runner, "spawn_guarded_turn", return_value=MagicMock()
+        ) as spawn, patch.object(chat_runner, "_run_chat", return_value=MagicMock()):
+            await chat_runner._start_next_queued_turn(state, slot)
+
+        assert spawn.call_count == 0, (
+            "an unverifiable requeued relay was delivered instead of refused"
+        )
+        assert not slot._queue, "the refused relay was left on the queue"
+
+    def test_a_requeued_relay_is_marked_unverifiable(self, tmp_path):
+        """The pins cannot survive the bare-string pending-steer list.
+
+        So the requeue must mark the relay unverifiable rather than let it reach
+        the drain with no pins, which reads as "nothing to compare" and would
+        deliver it unchecked.
+        """
+        from kiro_crew.dashboard.state import SESSION_CONTROL_PREFIX
+
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_steers = [f"{SESSION_CONTROL_PREFIX}relayed text"]
+
+        chat_runner._requeue_unconsumed_steers(state, slot)
+
+        sc = (slot._queue[0].get("meta") or {})["session_control"]
+        assert sc["requeued_unverifiable"] is True
+
+    def test_a_requeued_human_steer_is_not_marked(self, tmp_path):
+        """A human's own steer carries no relay marker and must stay deliverable."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_steers = ["just my own words"]
+
+        chat_runner._requeue_unconsumed_steers(state, slot)
+
+        assert not (slot._queue[0].get("meta") or {}).get("session_control")
+
     def test_requeue_is_a_noop_without_pending_steers(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
@@ -1341,7 +1395,112 @@ class TestSteerLifecycle:
 # ── queue drain / synthesis ───────────────────────────────────────────────
 
 
+class TestRelayRefusalNotice:
+    """The dropped-relay notice must name the reason it actually refused for."""
+
+    def test_a_drift_refusal_does_not_claim_a_channel_binding(self):
+        notice = chat_runner._relay_refusal_notice({"agent_switched"})
+
+        assert "channel" not in notice.lower(), (
+            "a drift refusal must not tell the user their session is channel-bound"
+        )
+        assert "agent or workspace" in notice
+
+    def test_a_requeued_relay_is_refused_because_it_cannot_be_re_verified(self):
+        notice = chat_runner._relay_refusal_notice({"requeue_unverifiable"})
+
+        assert "re-verified" in notice
+        assert "channel" not in notice.lower(), (
+            "a requeue refusal must not claim a channel binding"
+        )
+
+    def test_a_channel_refusal_still_names_the_channel(self):
+        notice = chat_runner._relay_refusal_notice({"linked_session_target"})
+
+        assert "channel" in notice.lower()
+
+    def test_a_mixed_batch_names_both(self):
+        notice = chat_runner._relay_refusal_notice(
+            {"linked_session_target", "workspace_switched"}
+        )
+
+        assert "channel" in notice.lower()
+        assert "agent or workspace" in notice
+
+
 class TestStartNextQueuedTurn:
+    @pytest.mark.asyncio
+    async def test_a_stale_relay_does_not_take_a_valid_one_with_it(self, tmp_path):
+        """Each relay is judged on its OWN pins, not on the batch's first entry.
+
+        Two relays can straddle an agent switch: the earlier one was pinned to the
+        old agent, the later one to the current agent. Judging the batch by one
+        entry deletes the other -- losing a message whose sender was told it had
+        been accepted.
+        """
+        state, slot = _state(tmp_path), _slot()
+        slot.agent = "current"
+        stale = slot.queue_append(
+            "from before the switch",
+            meta={"session_control": {"from_slot": "chat-1", "target_agent": "old"}},
+        )
+        fresh = slot.queue_append(
+            "from after the switch",
+            meta={"session_control": {"from_slot": "chat-1", "target_agent": "current"}},
+        )
+        # A drop is observable as a `queue_cancel` broadcast for that id, and that
+        # is what separates "deleted" from "legitimately consumed by the turn".
+        # Asserting on the remaining queue instead would PASS on the very loss
+        # being tested, because the batch bug empties the queue.
+        cancelled: list[str] = []
+        real_broadcast = state.broadcast_ws
+
+        def _spy(event, payload, *a, **kw):
+            if event == "queue_cancel":
+                cancelled.append(str(payload.get("queue_id")))
+            return real_broadcast(event, payload, *a, **kw)
+
+        with patch.object(state, "broadcast_ws", side_effect=_spy), patch.object(
+            chat_runner, "spawn_guarded_turn", return_value=MagicMock()
+        ), patch.object(chat_runner, "_run_chat", return_value=MagicMock()):
+            await chat_runner._start_next_queued_turn(state, slot)
+
+        assert stale in cancelled, "the stale relay was not dropped"
+        assert fresh not in cancelled, (
+            "the still-authorized relay was deleted along with the stale one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_relay_whose_target_switched_agent_is_dropped_at_the_drain(
+        self, tmp_path
+    ):
+        """The drain must FORWARD the relay's pins, not just carry them.
+
+        Without this the pins are written at the enqueue and compared in
+        `relay_still_deliverable`, but nothing joins the two halves -- the drift
+        check silently never fires while every unit test still passes. That is
+        exactly what a mutation removing the two keyword arguments proved, so this
+        test exists to fail on it.
+        """
+        state, slot = _state(tmp_path), _slot()
+        slot.agent = "switched-away"
+        slot.queue_append(
+            "relayed text",
+            meta={
+                "session_control": {
+                    "from_slot": "chat-1",
+                    "target_agent": "authorized-agent",
+                    "target_workspace": slot.workspace or "default",
+                }
+            },
+        )
+
+        with patch.object(chat_runner, "spawn_guarded_turn") as spawn:
+            assert await chat_runner._start_next_queued_turn(state, slot) is False
+
+        assert spawn.call_count == 0, "the relay ran against the switched-in agent"
+        assert not slot._queue, "the refused relay was left on the queue"
+
     @pytest.mark.asyncio
     async def test_empty_queue_starts_nothing(self, tmp_path):
         state, slot = _state(tmp_path), _slot()

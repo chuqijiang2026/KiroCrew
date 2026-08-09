@@ -685,6 +685,16 @@ SUBAGENT_COMPLETION_PREFIXES = (
 # user-facing summary. Rendered as an "inject" message (not a user bubble); the
 # prefix marks it as a synthetic continuation so it is NOT mirrored to linked
 # surfaces (Slack/Telegram) as though the user typed it.
+# One of the user's own chat sessions relayed a message to another through the
+# session-control tools. Carries the `[SYSTEM]` marker every automation injection
+# uses, because `session_summary._is_injected` classifies by content prefix: the
+# row is persisted under `role: user` so the target's turn machinery runs it, and
+# without the marker the summarizer would count a peer agent's text as one of the
+# human's own turns and number it as their intent. Quoted label plus an explicit
+# terminator so a reader can tell where the peer's text ends.
+SESSION_CONTROL_PREFIX = '[SYSTEM] Message from session "'
+SESSION_CONTROL_END = "[End of session message]"
+
 SUBAGENT_SYNTHESIS_PREFIX = "[SYSTEM] Sub-agent synthesis:"
 SUBAGENT_SYNTHESIS_PROMPT = (
     f"{SUBAGENT_SYNTHESIS_PREFIX} all sub-agents you spawned have completed and each result was "
@@ -1114,6 +1124,7 @@ class _ChatSlot:
         "_pending_variants",
         "_lock",
         "forked_from",
+        "created_by_tab",
         "_fork_lock",
         "_tab_id",
         "_channel_window_mtime",
@@ -1131,6 +1142,7 @@ class _ChatSlot:
         "_native_subagent_tracker",
         "_native_subagent_output",
         "_pending_steers",
+        "_steer_delivery_ids",
         "_wait_state",
         "_end_wait_request",
         "_wait_last_ping",
@@ -1454,6 +1466,14 @@ class _ChatSlot:
         self._pending_variants: list[dict] = []
         self._lock = asyncio.Lock()
         self.forked_from: str | None = None  # parent slot key if this is a fork
+        # The session-control caller that CREATED this slot, as its slot key.
+        # Session control may only send into a slot it created, so this is a
+        # privilege reference, not a breadcrumb: it is durable (rehydrated from
+        # metadata, so a restart does not silently revoke or grant anything) and
+        # deliberately NOT carried across session transfer, because a key that
+        # names one machine's slot would name a different, unrelated slot on
+        # another host and hand it authority it was never granted.
+        self.created_by_tab: str | None = None
         self._fork_lock: asyncio.Lock = asyncio.Lock()  # serialises concurrent forks on this slot
         self._tab_id: str = ""  # permanent tab identity for cross-restart session chaining
         # Transcript mtime the in-memory window was last brought up to date
@@ -1551,6 +1571,13 @@ class _ChatSlot:
         # STOP, error). Without this, a steer swallowed by a dying turn
         # vanished with no trace (see the requeue site).
         self._pending_steers: list[str] = []
+        # Opaque id per in-flight steer, keyed by its text (the one-per-text
+        # rule in chat_delivery makes that key unique). The requeue moves the id
+        # onto the queue entry and the drain unions entry meta onto the row it
+        # writes, which is how a caller can tell a delivery the drain already
+        # persisted from one the running turn consumed — a distinction the bare
+        # text cannot make.
+        self._steer_delivery_ids: dict[str, str] = {}
         # In-flight `wait` tool sleep, as reported by the tool's own keepalive
         # ping: {"wait_id": str, "seconds": int, "deadline_ts": float}. The
         # deadline is on the dashboard's clock (see api_session_keepalive) so
@@ -1931,7 +1958,9 @@ class _ChatSlot:
 
     # ── Queue helpers (dict-based queue items) ──
 
-    def queue_append(self, content: str, kind: str = "", meta: dict | None = None) -> str:
+    def queue_append(
+        self, content: str, kind: str = "", payload: str = "", meta: dict | None = None
+    ) -> str:
         """Append a message to the queue. Returns the generated queue ID.
 
         ``kind`` is a structural origin tag (e.g. ``"synthetic_recovery"`` for
@@ -1940,18 +1969,31 @@ class _ChatSlot:
         collide with user-typed text that happens to match an internal string.
         Empty string = plain user/system content (default).
 
+        ``payload`` is the orthogonal question of whether the TEXT is machine
+        speech, read by ``is_synthetic_payload_item`` when the drain decides
+        whether the turn may be mirrored to a linked channel as the user's own
+        words. Mirrored from :meth:`queue_insert`, so the two entry points cannot
+        disagree about an entry's origin.
+
         ``meta`` rides through to :meth:`append` when this entry is drained, so a
         row whose facts were computed at enqueue time (a sub-agent completion's
         structured header — see gateway ``_subagent_done``) keeps them instead of
-        forcing the drain to re-derive them from the prose.
+        forcing the drain to re-derive them from the prose. Provenance that lived
+        only on the delivering call would be lost the moment a message waits.
         """
         qid = uuid.uuid4().hex[:12]
         # dict[str, Any]: the base entry is all strings, but ``meta`` adds a dict
         # value, so the homogeneous str inference would reject the assignment.
-        item: dict[str, Any] = {"id": qid, "content": content, "kind": kind}
+        entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind}
+        # Both extras are only carried when set, so an ordinary append keeps the
+        # exact entry shape its consumers (and their tests) pin.
+        # ``is_synthetic_payload_item`` reads the payload with ``.get``, so absent
+        # and empty mean the same thing to the drain.
+        if payload:
+            entry["payload"] = payload
         if meta:
-            item["meta"] = meta
-        self._queue.append(item)
+            entry["meta"] = dict(meta)
+        self._queue.append(entry)
         self._note_enqueue()
         return qid
 
@@ -1970,7 +2012,14 @@ class _ChatSlot:
         """
         self._last_enqueue_ts = datetime.now(timezone.utc).isoformat()
 
-    def queue_insert(self, index: int, content: str, kind: str = "", payload: str = "") -> str:
+    def queue_insert(
+        self,
+        index: int,
+        content: str,
+        kind: str = "",
+        payload: str = "",
+        meta: dict | None = None,
+    ) -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
         See :meth:`queue_append` for the ``kind`` structural origin tag. ``payload``
@@ -1979,7 +2028,10 @@ class _ChatSlot:
         message shares the recovery kind but is not machine speech.
         """
         qid = uuid.uuid4().hex[:12]
-        self._queue.insert(index, {"id": qid, "content": content, "kind": kind, "payload": payload})
+        entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind, "payload": payload}
+        if meta:
+            entry["meta"] = dict(meta)
+        self._queue.insert(index, entry)
         self._note_enqueue()
         return qid
 

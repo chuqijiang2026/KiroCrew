@@ -45,6 +45,12 @@ agent *hint* only:
 * ``folder_id``, ``tags``, ``pinned``, ``artifact``, ``app``,
   ``linked_session_key`` and ``forked_from`` are all local-graph references and
   are not carried at all.
+* ``created_by_tab`` is not carried either, and for a stronger reason than the
+  rest: it is what session control checks before sending into a slot, so an id
+  that names a slot on the source host would name a DIFFERENT, unrelated slot
+  here and hand it authority over the imported session. The export names the
+  fields it carries, so this is excluded by construction; it is stated here so
+  the exclusion stays deliberate.
 """
 
 from __future__ import annotations

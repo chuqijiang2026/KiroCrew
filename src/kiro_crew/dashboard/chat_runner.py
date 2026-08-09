@@ -75,6 +75,8 @@ from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
     _MAX_TOOL_PURPOSE,
     _SLASH_COMMANDS,
+    SESSION_CONTROL_MAX_HOPS,
+    SESSION_CONTROL_PAYLOAD,
     ResetCause,
     _append_compaction_notice,
     _apply_incognito_prefix,
@@ -123,6 +125,7 @@ from kiro_crew.dashboard.state import (
     NATIVE_SUBAGENT_TERMINAL_KEEP,
     NATIVE_SUBAGENT_TERMINAL_TTL_SECS,
     REFUSAL_RECOVERY_PREFIX,
+    SESSION_CONTROL_PREFIX,
     STALE_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
     SUBAGENT_SYNTHESIS_PREFIX,
@@ -3361,6 +3364,21 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
     requeued = slot._pending_steers[:]
     slot._pending_steers.clear()
     for steer_msg in reversed(requeued):
+        # A relay from another session must not lose its machine origin on the
+        # way into the queue: the drain decides from the ENTRY whether the turn
+        # may be mirrored to a linked channel as the user's speech, and an
+        # untagged entry would put a peer agent's words in the user's mouth
+        # there. The pending-steer list holds bare strings, so the envelope
+        # prefix is the only provenance left at this boundary — the one place a
+        # content check is used, rather than in the shared predicate. Erring
+        # toward synthetic is the safe direction (see
+        # ``is_synthetic_payload_item``): a suppressed mirror loses an echo of
+        # something already on screen, a wrong mirror misattributes authorship.
+        _payload = (
+            SESSION_CONTROL_PAYLOAD
+            if steer_msg.startswith(SESSION_CONTROL_PREFIX)
+            else ""
+        )
         # Raw-at-rest by design: slot._queue is a DELIVERY payload (the drained
         # entry becomes the next turn's LLM input), matching every other queue
         # producer (queue_append in chat_handlers / messaging). All dashboard
@@ -3368,7 +3386,41 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         # apply _redact_for_display, and every queue_* broadcast (including the
         # queue_push below) sanitizes. Sanitizing at insert would corrupt the
         # delivered message relative to the normal queue path.
-        qid = slot.queue_insert(0, steer_msg)
+        # The depth of a relay chain cannot be recovered here — the pending-steer
+        # list holds bare strings — so a requeued relay is treated as having spent
+        # the budget. That stops the chain rather than silently restarting it at
+        # one, which is the failure this bound exists to prevent; a human's own
+        # steer carries no marker and is unaffected.
+        #
+        # The SAME information loss applies to the authorization pins the drain
+        # compares (`target_agent` / `target_workspace`): they were recorded on the
+        # queue entry this steer was promoted out of, and a bare string cannot
+        # carry them back. Marked unverifiable rather than re-pinned from the
+        # slot's CURRENT values, which would launder a switch that happened while
+        # the relay was in flight into a fresh approval. Same conservative
+        # direction as the hop budget above: refuse and say so, rather than
+        # deliver something that can no longer be re-checked.
+        _meta = (
+            {
+                "session_control": {
+                    "relayed": True,
+                    "hops": SESSION_CONTROL_MAX_HOPS,
+                    "requeued_unverifiable": True,
+                }
+            }
+            if _payload
+            else None
+        )
+        # Carry the delivery id the steer registered under. The drain unions every
+        # consumed entry's meta onto the row it writes, so this reaches the row even
+        # when several queued items are merged into one — which is the only way the
+        # steer's caller can tell "already persisted by the drain" from "consumed by
+        # the turn" after both bookkeeping lists have emptied.
+        _did = getattr(slot, "_steer_delivery_ids", {}).pop(steer_msg, "")
+        if _did:
+            _meta = dict(_meta or {})
+            _meta["steer_delivery_id"] = _did
+        qid = slot.queue_insert(0, steer_msg, payload=_payload, meta=_meta)
         try:
             content, _ = redact_exfiltration_urls(steer_msg)
             content, _ = redact_credentials(content)
@@ -3396,6 +3448,43 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
     )
 
 
+def _relay_refusal_notice(reasons: set[str]) -> str:
+    """The user-facing line for relays dropped at the drain.
+
+    Reason-specific on purpose: the notice used to name a channel binding for
+    every refusal, which became wrong as soon as the drift refusals existed --
+    telling the user their session was channel-bound when what actually changed
+    was its agent sends them looking for the wrong thing.
+    """
+    drift = {"workspace_switched", "agent_switched"} & reasons
+    requeued = "requeue_unverifiable" in reasons
+    channel = reasons - drift - {"requeue_unverifiable"}
+    if requeued and not drift and not channel:
+        return (
+            "⚠️ A message relayed from another session was not delivered: its turn "
+            "ended before the message was consumed, and the checks that authorized "
+            "it could not be re-verified on retry. Ask the sender to send it again."
+        )
+    if drift and not channel:
+        return (
+            "⚠️ A message relayed from another session was not delivered: this "
+            "session's agent or workspace changed after the message was accepted, "
+            "and session control does not cross that boundary."
+        )
+    if drift and channel:
+        return (
+            "⚠️ Messages relayed from another session were not delivered: this "
+            "session is now bound to a channel, and its agent or workspace "
+            "changed after they were accepted. Session control does not cross "
+            "either boundary."
+        )
+    return (
+        "⚠️ A message relayed from another session was not delivered: this "
+        "session is now bound to a channel, and session control does not cross "
+        "that boundary."
+    )
+
+
 async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> bool:
     """Dequeue and start one ready Kiro turn, preserving queue semantics."""
 
@@ -3410,6 +3499,78 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
             exc_info=True,
         )
         merge = False
+
+    # A queued relay has TWO delivery moments and `authorize_target` only covered
+    # the enqueue. The target's channel binding can change while the entry waits,
+    # and suppressing the text mirror is not enough on its own: the turn's REPLY
+    # still reaches a linked surface, so a relay whose target became channel-bound
+    # would land in front of that channel's audience by doing nothing but waiting.
+    #
+    # Filtered BEFORE the dequeue, not after: a merge consumes several entries at
+    # once, so refusing at that point would take an unrelated user prompt down with
+    # the relay. Removing the refused entries here leaves the dequeue to merge only
+    # what is still deliverable. Deferred import: `dashboard.chat` imports this
+    # module and `session_control` reaches back into it.
+    _refused: list[str] = []
+    _reasons: set[str] = set()
+    _check: Any = None
+    for _item in slot._queue:
+        _meta: Any = _item.get("meta") or {}
+        _sc: Any = _meta.get("session_control") if isinstance(_meta, dict) else None
+        if not isinstance(_sc, dict) or not _sc:
+            continue
+        if _check is None:
+            # Deferred, and only once a relay is actually present: `dashboard.chat`
+            # imports this module and `session_control` reaches back into it.
+            from kiro_crew.dashboard.session_control import relay_still_deliverable
+
+            _check = relay_still_deliverable
+        _origin = str(_sc.get("from_slot") or "")
+        # Judged per ENTRY, not once for the batch. The channel refusals are
+        # slot-level and answer the same for every relay, but the drift
+        # refusals compare pins recorded when THAT relay was accepted. Two
+        # relays can straddle an agent switch, and refusing the batch on the
+        # older one's pins would delete a newer relay that is still
+        # deliverable -- silently losing a message its sender was told had
+        # been accepted.
+        _refusal = _check(
+            state,
+            slot,
+            caller_session_key=f"dashboard:{_origin}" if _origin else "",
+            pinned_agent=(
+                str(_sc["target_agent"] or "") if "target_agent" in _sc else None
+            ),
+            pinned_workspace=(
+                str(_sc["target_workspace"] or "default")
+                if "target_workspace" in _sc
+                else None
+            ),
+            unverifiable=bool(_sc.get("requeued_unverifiable")),
+        )
+        if _refusal:
+            _refused.append(str(_item["id"]))
+            _reasons.add(_refusal)
+    if _refused:
+        for qid in _refused:
+            content = slot.queue_remove_by_id(qid)
+            _remove_queued_by_id(slot.messages, qid)
+            state.broadcast_ws(
+                "queue_cancel",
+                {
+                    "slot": slot.key,
+                    "queue_id": qid,
+                    "content": _redact_for_display(content or ""),
+                },
+            )
+        slot.append("error", _relay_refusal_notice(_reasons), "msg msg-err")
+        state.push_slots_update()
+        if not slot._queue:
+            # The entry guard above established that the queue is non-empty,
+            # and `_dequeue_next_message` relies on it -- its last statement is
+            # an unguarded `queue_pop(0)`. Removing entries here can falsify
+            # that invariant after the guard has already passed, so restore it:
+            # a queue holding nothing but refused relays has no turn to start.
+            return False
 
     hold_users = bool(
         (
@@ -3462,19 +3623,6 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     cron_label = match.group(1) if match else "cron"
     cron_label, _ = redact_exfiltration_urls(cron_label)
     cron_label, _ = redact_credentials(cron_label)
-    # Structured completion facts stamped at enqueue time (gateway _subagent_done)
-    # ride through to the row so the card reads them instead of re-parsing the
-    # header prose. Only a single, un-merged system injection carries
-    # them: a merge concatenates several entries under one synthetic header, for
-    # which per-entry facts are meaningless — subagent completions never merge
-    # (they drain one at a time and break any user-message merge), so this only
-    # fires on the shape it was computed for.
-    _row_meta = consumed[0].get("meta") if (is_subagent and len(consumed) == 1) else None
-    # When synthesis is pending, mark the completion so the frontend can collapse
-    # the per-completion assistant response that follows (it will be restated by
-    # the synthesis turn).
-    if is_subagent and slot._pending_synthesis and isinstance(_row_meta, dict):
-        _row_meta = {**_row_meta, "synthesisPending": True}
     if is_subagent:
         row_role = "subagent"
     elif is_cron or is_recovery:
@@ -3489,11 +3637,45 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         row_cls = "msg msg-inject"
     else:
         row_cls = "msg msg-u"
+    # Provenance a producer attached to the queue entry belongs on the row the
+    # drain writes, not only on the entry that is about to disappear: a relay's
+    # hop count is read back off the transcript, so losing it here silently
+    # restarts a chain the budget is supposed to bound.
+    _drained_meta: dict = {}
+    # Delivery ids ACCUMULATE; everything else is last-writer-wins. A merge folds
+    # several queued messages into one row, and each may carry its own steer's id —
+    # a plain `update` would keep only the last, and every other caller would see
+    # no row for its delivery and append a duplicate. The row stands for all of
+    # them, so it has to name all of them.
+    #
+    # Accumulating generally does not undo the narrow rule above: per-entry
+    # subagent facts would be meaningless on a merged row, but a subagent
+    # completion never merges (it drains alone and breaks any user-message
+    # merge), so a merged row cannot carry them in the first place.
+    _drained_ids: list[str] = []
+    for item in consumed:
+        _item_meta = item.get("meta")
+        if isinstance(_item_meta, dict):
+            _one = _item_meta.get("steer_delivery_id")
+            if isinstance(_one, str) and _one:
+                _drained_ids.append(_one)
+            _many = _item_meta.get("steer_delivery_ids")
+            if isinstance(_many, list):
+                _drained_ids.extend(x for x in _many if isinstance(x, str) and x)
+            _drained_meta.update(_item_meta)
+    if _drained_ids:
+        _drained_meta.pop("steer_delivery_id", None)
+        _drained_meta["steer_delivery_ids"] = _drained_ids
+    # When synthesis is pending, mark the completion so the frontend can collapse
+    # the per-completion assistant response that follows (it will be restated by
+    # the synthesis turn).
+    if is_subagent and slot._pending_synthesis and _drained_meta:
+        _drained_meta["synthesisPending"] = True
     slot.append(
         row_role,
         next_msg,
         row_cls,
-        meta=_row_meta if isinstance(_row_meta, dict) else None,
+        meta=_drained_meta or None,
     )
 
     task = spawn_guarded_turn(

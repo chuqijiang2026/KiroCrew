@@ -101,3 +101,23 @@ def test_blocked_tool_matcher_precision(rendered, expected):
     from kiro_crew.channel import _blocked_tool_named
 
     assert _blocked_tool_named(rendered) is expected
+
+
+def test_every_session_control_tool_is_contained():
+    """The whole session-control surface sits behind this boundary, not part of it.
+
+    Pinned against the advertised tool set rather than a hand-written list, so a
+    fifth verb fails here instead of shipping reachable from a channel agent. The
+    omission this guards against is not hypothetical: `session_create` was added
+    to the surface and missed here, and nothing else in the suite noticed.
+
+    Create earns its place for a different reason than the other three. It writes
+    nothing into an existing conversation, but the session it opens is one the
+    channel agent then OWNS -- and owned sessions are exactly what
+    `session_message_send` accepts, so leaving create reachable would hand back
+    the delivery path this list is meant to close.
+    """
+    from kiro_crew.mcp_dashboard import SESSION_CONTROL_TOOLS
+
+    missing = sorted(set(SESSION_CONTROL_TOOLS) - set(CHANNEL_AGENT_BLOCKED_TOOLS))
+    assert not missing, f"session-control tools reachable from a channel agent: {missing}"

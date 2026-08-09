@@ -604,6 +604,8 @@ def _rehydrate_slot_from_history(
             state._restricted_keys.add(f"dashboard:{slot_name}")
         if meta.get("forked_from") is not None:
             slot.forked_from = meta["forked_from"]
+        if meta.get("created_by_tab") is not None:
+            slot.created_by_tab = meta["created_by_tab"]
         if meta.get("linked_session_key"):
             # Rebind the slot to the session its conversation actually runs on.
             # Skipped, the slot would answer from a dashboard-only session and the
@@ -969,6 +971,8 @@ def _restore_recent_sessions_steps(
             state._restricted_keys.add(f"dashboard:{slot_name}")
         if meta.get("forked_from") is not None:
             slot.forked_from = meta["forked_from"]
+        if meta.get("created_by_tab") is not None:
+            slot.created_by_tab = meta["created_by_tab"]
         if meta.get("linked_session_key"):
             slot.linked_session_key = str(meta["linked_session_key"])
         elif is_channel_session_key(key) and state.sessions:
@@ -1854,6 +1858,13 @@ def _save_slot_to_history(
                 meta_line["human_seen"] = True
             if slot.forked_from is not None:
                 meta_line["forked_from"] = slot.forked_from
+            if slot.created_by_tab is not None:
+                # Named in SLOT_OWNED_META_KEYS, so it MUST be written here: for
+                # an owned key an absent field means "cleared", and session
+                # control reads this to decide whether a caller may send into
+                # this slot. Dropping it would silently revoke that authority on
+                # the next full save.
+                meta_line["created_by_tab"] = slot.created_by_tab
             if slot.linked_session_key:
                 # The slot's conversation lives on another session (a channel
                 # thread, a cron job). Nothing recreates that binding on
