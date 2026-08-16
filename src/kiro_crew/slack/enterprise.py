@@ -19,7 +19,12 @@ from __future__ import annotations
 
 import logging
 
-from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.loader import (
+    ConfigReadError,
+    config_local_path,
+    config_path,
+    read_config_for_update,
+)
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -43,7 +48,92 @@ _allowed_team_ids: set[str] = set()
 _allowlist_configured: bool = False
 
 
-def _load_allowed_team_ids() -> None:
+def _read_allowlist() -> tuple[set[str] | None, str]:
+    """Read ``slack.allowed_enterprise_ids`` from config, or refuse the config.
+
+    Returns ``(ids, "")`` on a usable config, or ``(None, reason)`` when the
+    config cannot be honoured and the caller must fail CLOSED.
+
+    **One reader.** The same validated read decides BOTH "is this config
+    usable" and "what is the allowlist", so the two answers can never
+    disagree.  Asking ``KiroCrewConfig.load()`` for the value while probing the
+    file separately for health is what let malformed input reopen the
+    allowlist: ``load()`` normalizes bad input away at several points and
+    returns a defaults-shaped object, which is indistinguishable from "the
+    operator configured nothing" -- and "configured nothing" means
+    default-open.  Every shape below was a distinct door into that one room.
+
+    A shape is refused when the operator clearly asked for a restriction we
+    cannot honour, and accepted when it is genuinely absent:
+
+    * unreadable / non-object file -> refuse (``ConfigReadError``)
+    * a symlink whose target is missing -> refuse; the link is a configuration
+      artifact, so config was meant to be here and is merely unavailable. This
+      is deliberately NOT the same as the absent-file case below: no file at all
+      means none was ever written, which is a fresh install.
+    * absent file -> skip; an absent config is genuinely unconfigured
+    * ``slack`` present but not an object -> refuse (``load()`` would coerce it
+      to ``{}`` and drop the allowlist)
+    * ``allowed_enterprise_ids`` absent -> skip, nothing configured here
+    * present but not a list -> refuse (``load()`` iterates it, so a bare
+      string yields per-character entries)
+    * present and non-empty, but NO entry survives validation -> refuse; the
+      operator asked for a restriction and none of it is usable, and silently
+      collapsing to empty would mean default-open
+
+    Mixed valid/invalid entries keep the valid ones, matching the loader: that
+    narrows the allowlist rather than widening it, so it is not a widening
+    door and dropping the operator's working ids would be a regression.
+
+    ``config.local.json`` REPLACES the base list when it carries the key, which
+    is what ``_deep_merge`` does to a list value -- so the overlay is applied
+    last here too.
+    """
+    ids: set[str] = set()
+    for path in (config_path(), config_local_path()):
+        # A symlink whose target is GONE is not an absent config. The link is
+        # itself a configuration artifact, so the operator meant config to live
+        # here and it is currently unavailable -- which must not be read as
+        # permission. ``exists()`` follows the link, so this is true ONLY when
+        # the target is missing; an intact symlink pointing at a file that
+        # happens to hold ``{}`` still reads as genuinely unconfigured below.
+        if path.is_symlink() and not path.exists():
+            return None, f"{path.name}: symlink target is missing"
+        try:
+            raw = read_config_for_update(path)
+        except ConfigReadError as e:
+            return None, str(e)
+        if not raw:
+            continue
+        if "slack" not in raw:
+            continue
+        slack = raw["slack"]
+        if not isinstance(slack, dict):
+            return None, f"{path.name}: 'slack' is not a JSON object"
+        if "allowed_enterprise_ids" not in slack:
+            continue
+        entries = slack["allowed_enterprise_ids"]
+        if not isinstance(entries, list):
+            return None, (
+                f"{path.name}: slack.allowed_enterprise_ids is "
+                f"{type(entries).__name__}, expected a list"
+            )
+        # Same per-entry filter the loader applies: Slack enterprise/team ids.
+        usable = {
+            e for e in entries
+            if isinstance(e, str) and (e.startswith("E") or e.startswith("T"))
+        }
+        if entries and not usable:
+            return None, (
+                f"{path.name}: slack.allowed_enterprise_ids has "
+                f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} but "
+                f"none is a usable Slack id"
+            )
+        ids = usable
+    return ids, ""
+
+
+def _load_allowed_team_ids() -> bool:
     """Populate ``_allowed_team_ids`` from validated state + config.
 
     Called by ``validate_enterprise()`` after the validated team_id has
@@ -60,31 +150,69 @@ def _load_allowed_team_ids() -> None:
     any ``slack.allowed_enterprise_ids`` entries.  When none are
     configured the module stays default-open.
 
-    Config load failures are logged and SEL-audited but do not raise —
-    the cache falls back to just the validated team_id.
+    Fail-closed on a degraded read: the allowlist value and the "is this config
+    usable" judgement both come from :func:`_read_allowlist`, which documents
+    that invariant and why it matters. When that read refuses the config, this
+    function keeps ``_allowlist_configured`` True with only the validated
+    team_id admitted, and SEL-audits it, rather than silently widening the
+    allowlist.
+
+    Returns True when the read was DEGRADED (refused). The caller must honour
+    that: no other source of ids -- including ones the caller derived from its
+    own ``KiroCrewConfig.load()`` -- may widen the allowlist afterwards, or the
+    refusal made here is silently undone one level up.
     """
     global _allowed_team_ids, _allowlist_configured
     allowed: set[str] = set()
     if _validated_team_id:
         allowed.add(_validated_team_id)
+
+    configured: set[str] | None
     try:
-        cfg = KiroCrewConfig.load()
-        configured = set(cfg.slack.allowed_enterprise_ids)
-        _allowlist_configured = bool(configured)
-        allowed.update(configured)
+        configured, refusal = _read_allowlist()
     except Exception:
+        configured, refusal = None, "unexpected error reading config"
         logger.exception(
-            "Failed to load slack.allowed_enterprise_ids; "
-            "using validated team_id only"
+            "Failed to read slack.allowed_enterprise_ids; failing closed "
+            "with validated team_id only"
+        )
+
+    if configured is None:
+        # The config cannot be honoured: unreadable, or a shape whose meaning
+        # we cannot determine. An empty allowlist is indistinguishable from
+        # "operator configured none", and "configured none" means default-open,
+        # so guessing here is guessing in the WIDENING direction. Fail CLOSED:
+        # keep the allowlist "configured" with only the validated team_id
+        # admitted so check_message_origin() denies foreign origins, and
+        # SEL-audit it. We cannot know the intended list, so the authenticated
+        # workspace is the only origin we can honestly admit.
+        _allowlist_configured = True
+        logger.error(
+            "slack.allowed_enterprise_ids could not be read (%s); "
+            "failing closed with validated team_id only",
+            refusal,
         )
         sel().log_api_access(
             caller="gateway",
             operation="slack.allowed_team_ids_load",
-            outcome="error",
+            outcome="denied",
             source="startup",
-            error="config_load_failed",
+            error="config_load_degraded_fail_closed",
         )
+        _allowed_team_ids = allowed
+        return True
+    elif configured:
+        # Every config file read cleanly and the operator configured an
+        # allowlist.
+        _allowlist_configured = True
+        allowed.update(configured)
+    else:
+        # Genuinely unconfigured: no config file, or a clean file with no
+        # allowlist entries.  Stay default-open exactly as before.
+        _allowlist_configured = False
+
     _allowed_team_ids = allowed
+    return False
 
 
 def _governance_posture_permits_workspace(enterprise_id: str, team_id: str) -> bool:
@@ -192,19 +320,43 @@ def validate_enterprise(
         # An allowlist is configured if extra_ids was passed OR the
         # operator set slack.allowed_enterprise_ids in config.  Reading
         # config here cannot rely on auth.test having succeeded, so check
-        # it directly.
-        configured: set[str] = set()
+        # it directly -- through the SAME validated reader
+        # ``_load_allowed_team_ids`` uses, so the two call sites cannot
+        # disagree about whether a restriction exists.
+        #
+        # A config we cannot read counts as "a restriction may be in force".
+        # Swallowing the error and leaving ``configured`` empty would make an
+        # unreadable config indistinguishable from "no allowlist", and that
+        # branch ACCEPTS an unverifiable workspace -- the same silent widening
+        # this module exists to prevent, reached from the auth.test-failure
+        # path instead of the startup path.
+        # Guarded exactly like ``_load_allowed_team_ids``' call: an unexpected
+        # exception from the reader (not just ConfigReadError -- e.g. a
+        # RecursionError from pathologically nested JSON) must degrade to
+        # "config unreadable" and fail CLOSED, not escape into
+        # ``init_socket_mode()`` and take the gateway down. The pre-fix code
+        # here wrapped its own read in ``except Exception``; keeping that
+        # blanket guard at one call site and not the other would be an
+        # asymmetry, and this branch is the one reached while Slack is already
+        # failing.
         try:
-            cfg = KiroCrewConfig.load()
-            configured = set(cfg.slack.allowed_enterprise_ids)
+            ids, refusal = _read_allowlist()
         except Exception:
+            ids, refusal = None, "unexpected error reading config"
             logger.exception(
-                "Failed to load slack.allowed_enterprise_ids during "
-                "auth.test failure handling"
+                "Failed to read slack.allowed_enterprise_ids while handling "
+                "an auth.test failure; failing closed"
             )
-        allowlist = extra | configured
+        config_unreadable = ids is None
+        if config_unreadable:
+            logger.error(
+                "slack.allowed_enterprise_ids could not be read (%s) while "
+                "handling an auth.test failure; failing closed",
+                refusal,
+            )
+        allowlist = extra | (ids or set())
 
-        if allowlist:
+        if allowlist or config_unreadable:
             # FAIL CLOSED: an operator restriction is in force but the
             # workspace identity could not be verified.  Accepting an
             # unverifiable workspace against an explicit allowlist would
@@ -250,10 +402,30 @@ def validate_enterprise(
     # slack.allowed_enterprise_ids config).
     _validated_team_id = team_id
     _validated_enterprise_id = enterprise_id
-    _load_allowed_team_ids()
-    if extra:
+    degraded = _load_allowed_team_ids()
+    if extra and not degraded:
         _allowlist_configured = True
         _allowed_team_ids.update(extra)
+    elif extra:
+        # The config read REFUSED, and ``extra`` is the caller's own
+        # ``KiroCrewConfig.load()``-derived value -- which degrades a torn
+        # overlay by DROPPING it, yielding the pre-overlay BASE list. Unioning
+        # it here would re-admit exactly the origins the operator removed in
+        # that overlay, undoing the refusal `_load_allowed_team_ids` just made:
+        # the same two-reader widening, with the CALLER as the second reader.
+        # The allowlist stays configured with only the validated team_id.
+        logger.error(
+            "slack.allowed_enterprise_ids could not be read; ignoring %d "
+            "caller-supplied id(s) rather than widening a degraded allowlist",
+            len(extra),
+        )
+        sel().log_api_access(
+            caller="gateway",
+            operation="slack.enterprise_validation",
+            outcome="denied",
+            source="startup",
+            error="extra_ids_ignored_on_degraded_config",
+        )
 
     # Default-open unless the operator configured an allowlist.
     if _allowlist_configured:
