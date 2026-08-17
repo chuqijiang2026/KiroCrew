@@ -352,6 +352,12 @@ class _ProbeResult:
     # UI can render "as of <time>". Two clocks, one write, no drift.
     probed_at_wall: float = 0.0
     probe_mode: str = "handshake"
+    # Authorization evidence from the probe response. Cached alongside the status
+    # because the panel is served from this cache for the whole TTL — a badge that
+    # only distinguished sign-in state on the one uncached read would spend almost
+    # all of its life showing the vaguer wording.
+    auth_challenge: bool = False
+    auth_grant_present: bool = False
 
 
 # Module-level probe cache: server name → result
@@ -413,6 +419,8 @@ def _cache_probe(server: McpServerInfo) -> None:
         tool_annotations=[dict(a) for a in server.tool_annotations],
         probed_at_wall=server.probed_at,
         probe_mode=server.probe_mode,
+        auth_challenge=server.auth_challenge,
+        auth_grant_present=server.auth_grant_present,
     )
 
 
@@ -605,6 +613,20 @@ class McpServerInfo:
     # API payload so a badge can say WHEN it was true — the caches legitimately
     # serve results up to their TTL, and an undated "Online" reads as "now".
     probed_at: float = 0.0
+    # -- authorization state (remote probes only) ---------------------------
+    # True when the probe response carried a recognisable OAuth challenge, False
+    # when it did not. False is genuinely "not known to need OAuth" and not "does
+    # not need it": a server can refuse a tokenless probe without saying why.
+    #
+    # A boolean rather than the scheme name because that is all any consumer asks.
+    # The challenge's scope list and RFC 9728 metadata URL are parsed (they are
+    # what makes the challenge recognisable) but deliberately not carried: nothing
+    # renders them, and an exported field with no reader is surface without a
+    # purpose.
+    auth_challenge: bool = False
+    # Whether the runtime holds a grant for this url. Only meaningful alongside
+    # ``auth_challenge``; see :func:`_runtime_grant_present`.
+    auth_grant_present: bool = False
 
     @property
     def is_remote(self) -> bool:
@@ -639,6 +661,14 @@ class McpServerInfo:
                 d["scopes"] = list(self.scopes)
             if self.client_id:
                 d["clientId"] = self.client_id
+            # Gated on ``auth_challenge`` being set, so an absent key means "this
+            # probe learned nothing about authorization" and a present
+            # ``authGrantPresent`` is always a real observation. A client that
+            # cannot tell those apart would render "sign-in required" for every
+            # unprobed remote row.
+            if self.auth_challenge:
+                d["authChallenge"] = True
+                d["authGrantPresent"] = self.auth_grant_present
         if self.disabled_tools:
             d["disabledTools"] = self.disabled_tools
         if self.disabled:
@@ -1174,6 +1204,14 @@ def list_servers() -> list[McpServerInfo]:
         s.error = error
         s.probed_at = probed_at
         s.probe_mode = probe_mode
+        # Read through ``probe_metadata`` rather than widening ``_get_cached``'s
+        # tuple, and taken even from an expired entry: a server that demanded
+        # OAuth an hour ago still demands it, so the wording should not regress
+        # to the vaguer form the moment the TTL lapses.
+        cached = probe_metadata(s.name)
+        if cached is not None:
+            s.auth_challenge = cached.auth_challenge
+            s.auth_grant_present = cached.auth_grant_present
 
     return list(servers.values())
 
@@ -1223,11 +1261,99 @@ def _needs_authorization(
     return False
 
 
+# A challenge comes from an endpoint that has not authenticated anything yet, so
+# every bound here is on untrusted input. Over-long values are DISCARDED rather
+# than truncated: a clipped metadata URL would still render as a link and would
+# point somewhere other than the server named it.
+_MAX_CHALLENGE_LEN = 2048
+_MAX_CHALLENGE_SCOPES = 32
+_MAX_SCOPE_LEN = 64
+_CHALLENGE_PARAM_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"([^"]*)"')
+
+
+def _parse_bearer_challenge(header_value: str) -> tuple[str, list[str]]:
+    """The ``resource_metadata`` URL and ``scope`` list from a Bearer challenge.
+
+    Recognising OAuth is the whole job here, so this is deliberately not a general
+    RFC 9110 auth-param parser: a challenge naming another scheme, or one whose
+    params are unquoted, yields empty values and the caller falls back to the
+    status code alone.
+
+    ``resource_metadata`` is kept only when it is https — the value is rendered to
+    the user as the server's own identity claim (RFC 9728 §5.1), and an http or
+    javascript URL arriving from an unauthenticated endpoint is not that.
+
+    Total by construction: a probe must never fail because of the shape of a
+    header, so anything that is not a string is simply not a challenge.
+    """
+    if not isinstance(header_value, str) or not header_value:
+        return "", []
+    if len(header_value) > _MAX_CHALLENGE_LEN:
+        return "", []
+    if not header_value.lstrip().lower().startswith("bearer"):
+        return "", []
+    params = {k.lower(): v for k, v in _CHALLENGE_PARAM_RE.findall(header_value)}
+    resource_metadata = params.get("resource_metadata", "")
+    if not resource_metadata.lower().startswith("https://"):
+        resource_metadata = ""
+    scopes = [s for s in params.get("scope", "").split() if len(s) <= _MAX_SCOPE_LEN]
+    return resource_metadata, scopes[:_MAX_CHALLENGE_SCOPES]
+
+
+async def _runtime_grant_present(mcp_url: str, name: str) -> bool:
+    """Whether the kiro-cli runtime already holds an OAuth grant for ``mcp_url``.
+
+    This is what separates "nobody has signed in" from "signed in, but this probe
+    cannot see it" — the two states a bare 401 conflates. The probe holds no token
+    of its own (Kiro Crew stores no credentials), so the runtime's own artifacts
+    are the only evidence available, and they are stat-ed for presence, never read.
+
+    ``name`` is what gets logged, never ``mcp_url``: a user-added endpoint can
+    carry a credential in its userinfo or query string, and this runs for any URL
+    someone typed, not just a vetted one.
+
+    Never raises: an unreadable cache home means "no observable grant", which
+    degrades the badge to the same wording used when the answer is unknown.
+    """
+    # Two blocking rules meet here and jointly decide the shape.
+    #
+    # NOT at module scope: ``connections.mint`` pulls in the agent and ACP layers,
+    # and this module is reachable from the handlers package the gateway imports at
+    # boot — ``test_the_handlers_package_does_not_import_the_mint_engine`` fails on
+    # that, and ``no-new-work-on-gateway-boot-path`` forbids it. (There is no
+    # circular import; both orders import cleanly.)
+    #
+    # NOT a bare deferred import either: because of the above, this call site is
+    # genuinely the first importer in a live gateway, so the first-time load walks
+    # and compiles that whole subtree. That is large synchronous file IO, which
+    # ``no-blocking-call-on-event-loop`` forbids on the loop. So the load itself is
+    # offloaded; after the first call it is a ``sys.modules`` hit and the hop costs
+    # only a thread handoff.
+    #
+    # Single-sourcing the cache-key derivation is what makes the import worth
+    # having at all: it mirrors an undocumented kiro-cli internal, and a second
+    # copy would rot against it silently.
+    mint = await asyncio.to_thread(importlib.import_module, "kiro_crew.connections.mint")
+
+    try:
+        return await mint.grant_observed(mcp_url)
+    except OSError:
+        logger.debug("MCP probe [%s]: grant presence unreadable", name, exc_info=True)
+        return False
+
+
 async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
     """Probe a remote Streamable HTTP MCP server via POST."""
     server.status = "probing"
     server.probed_at = time.time()
     server.probe_mode = "handshake"
+    # Each probe is the sole authority for its own authorization evidence, so it
+    # starts from zero. ``list_servers`` rehydrates these from the NAME-keyed probe
+    # cache before a re-probe, so a row whose url was edited would otherwise
+    # inherit the previous endpoint's challenge and keep reporting "Sign-in
+    # required" for a server that never asked for one.
+    server.auth_challenge = False
+    server.auth_grant_present = False
     try:
         init_body = {
             "jsonrpc": "2.0",
@@ -1249,6 +1375,18 @@ async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(server.url, json=init_body, headers=hdrs) as resp:
                 if resp.status != 200:
+                    # Parsed before the branch, so it is recorded on BOTH outcomes.
+                    # A rejected static credential is still an OAuth server, and
+                    # that is precisely the case where the user most needs to be
+                    # told the token they pasted is the wrong kind of credential.
+                    metadata_url, challenge_scopes = _parse_bearer_challenge(
+                        resp.headers.get("WWW-Authenticate", "")
+                    )
+                    if metadata_url or challenge_scopes:
+                        server.auth_challenge = True
+                        server.auth_grant_present = await _runtime_grant_present(
+                            server.url, server.name
+                        )
                     if _needs_authorization(resp.status, resp.headers, server.headers):
                         # A remote OAuth server answers a tokenless probe with
                         # 401 (or 403 + WWW-Authenticate). That is the expected

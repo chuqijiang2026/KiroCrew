@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1828,6 +1830,273 @@ class TestProbeRemote:
         assert _needs_authorization(401, {}, {"authorization": "Bearer x"}) is False
         # Other statuses are never needs_auth.
         assert _needs_authorization(500, {}, {}) is False
+
+    def test_the_challenge_parser_reads_a_real_oauth_challenge(self) -> None:
+        """The RFC 9728 pointer and the requested scopes both come back."""
+        from kiro_crew.mcp_discovery import _parse_bearer_challenge
+
+        metadata, scopes = _parse_bearer_challenge(
+            'Bearer resource_metadata="https://mcp.example.ai/.well-known/'
+            'oauth-protected-resource/mcp", scope="openid email offline_access"'
+        )
+        assert metadata == "https://mcp.example.ai/.well-known/oauth-protected-resource/mcp"
+        assert scopes == ["openid", "email", "offline_access"]
+
+    @pytest.mark.parametrize(
+        "challenge",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("Basic realm=\"x\"", id="another-scheme-entirely"),
+            pytest.param('Bearer resource_metadata="http://insecure.example/x"', id="http-metadata"),
+            pytest.param(
+                'Bearer resource_metadata="javascript:alert(1)"', id="non-http-scheme-metadata"
+            ),
+            pytest.param('Bearer resource_metadata=' + "x" * 4096, id="over-length"),
+            pytest.param(None, id="not-a-string-at-all"),
+        ],
+    )
+    def test_the_challenge_parser_yields_nothing_it_cannot_vouch_for(self, challenge) -> None:
+        """Anything unrecognised or unsafe to render degrades to empty, never raises.
+
+        The metadata URL is shown to the user as the server's own claim about
+        itself, so a plaintext or script URL from an unauthenticated endpoint is
+        dropped rather than passed along.
+        """
+        from kiro_crew.mcp_discovery import _parse_bearer_challenge
+
+        assert _parse_bearer_challenge(challenge) == ("", [])
+
+    def test_the_challenge_parser_bounds_untrusted_scope_lists(self) -> None:
+        """A scope list cannot grow the payload without limit."""
+        from kiro_crew.mcp_discovery import (
+            _MAX_CHALLENGE_SCOPES,
+            _MAX_SCOPE_LEN,
+            _parse_bearer_challenge,
+        )
+
+        many = " ".join(f"s{i}" for i in range(_MAX_CHALLENGE_SCOPES * 3))
+        _, scopes = _parse_bearer_challenge(f'Bearer scope="{many}"')
+        assert len(scopes) == _MAX_CHALLENGE_SCOPES
+
+        long_one = "x" * (_MAX_SCOPE_LEN + 1)
+        _, scopes = _parse_bearer_challenge(f'Bearer scope="openid {long_one}"')
+        assert scopes == ["openid"]
+
+    @pytest.mark.asyncio
+    async def test_a_tokenless_401_records_the_challenge_and_an_absent_grant(self) -> None:
+        """needs_auth carries the evidence that separates it from 'signed in already'."""
+        server = McpServerInfo(name="remote", url="https://example.com/mcp")
+
+        resp = MagicMock()
+        resp.status = 401
+        resp.headers = {
+            "WWW-Authenticate": 'Bearer resource_metadata="https://example.com/.well-known/x",'
+            ' scope="openid email"'
+        }
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session), patch(
+            "kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=False)
+        ):
+            result = await _probe_remote(server)
+
+        assert result.status == "needs_auth"
+        assert result.auth_challenge is True
+        assert result.auth_grant_present is False
+        payload = result.to_dict()
+        assert payload["authChallenge"] is True
+        assert payload["authGrantPresent"] is False
+
+    @pytest.mark.asyncio
+    async def test_an_existing_runtime_grant_is_reported_alongside_needs_auth(self) -> None:
+        """A held grant is what makes 'cannot verify' the honest wording rather than 'sign in'."""
+        server = McpServerInfo(name="remote", url="https://example.com/mcp")
+
+        resp = MagicMock()
+        resp.status = 401
+        resp.headers = {"WWW-Authenticate": 'Bearer scope="openid"'}
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session), patch(
+            "kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=True)
+        ):
+            result = await _probe_remote(server)
+
+        assert result.status == "needs_auth"
+        assert result.auth_grant_present is True
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_static_credential_still_records_the_oauth_challenge(self) -> None:
+        """The error branch keeps the challenge, because that is the actionable part.
+
+        A pasted token against an OAuth-only server is a real error — but the
+        useful thing to say is that the server wants a sign-in, not that it
+        answered 401.
+        """
+        server = McpServerInfo(
+            name="remote",
+            url="https://example.com/mcp",
+            headers={"Authorization": "Bearer pasted-placeholder"},
+        )
+
+        resp = MagicMock()
+        resp.status = 401
+        resp.headers = {"WWW-Authenticate": 'Bearer scope="openid offline_access"'}
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session), patch(
+            "kiro_crew.mcp_discovery._runtime_grant_present", AsyncMock(return_value=False)
+        ):
+            result = await _probe_remote(server)
+
+        assert result.status == "error"
+        assert "401" in result.error
+        assert result.auth_challenge is True
+
+    def test_a_probe_that_learned_nothing_emits_no_auth_keys(self) -> None:
+        """An absent key is what lets a client tell 'unknown' from 'no grant'."""
+        payload = McpServerInfo(name="remote", url="https://example.com/mcp").to_dict()
+
+        assert "authChallenge" not in payload
+        assert "authGrantPresent" not in payload
+
+    def test_the_probe_cache_round_trips_the_authorization_evidence(self) -> None:
+        """The panel is served from this cache, so the evidence has to survive it."""
+        from kiro_crew.mcp_discovery import _cache_probe, probe_metadata
+
+        server = McpServerInfo(
+            name="cached-remote",
+            url="https://example.com/mcp",
+            status="needs_auth",
+            auth_challenge=True,
+            auth_grant_present=True,
+        )
+        _cache_probe(server)
+
+        cached = probe_metadata("cached-remote")
+        assert cached is not None
+        assert cached.auth_challenge is True
+        assert cached.auth_grant_present is True
+
+    @pytest.mark.asyncio
+    async def test_the_deferred_mint_load_runs_off_the_event_loop(self) -> None:
+        """The first load walks and compiles the agent/ACP subtree — not on the loop.
+
+        The boot ratchet keeps ``connections.mint`` out of the handlers import
+        graph, which makes THIS call site the first importer in a live gateway, so
+        the one-time cost lands here. ``no-blocking-call-on-event-loop`` puts large
+        synchronous file IO in a worker, so the import is offloaded and this pins
+        the thread it ran on.
+        """
+        import importlib as _importlib
+
+        from kiro_crew.mcp_discovery import _runtime_grant_present
+
+        real = _importlib.import_module
+        threads: list[int] = []
+
+        def recording(name: str, *a: object, **kw: object) -> object:
+            # Only the module under test: the patch machinery itself imports on the
+            # main thread, and counting those would fail the assertion spuriously.
+            if name == "kiro_crew.connections.mint":
+                threads.append(threading.get_ident())
+            return real(name, *a, **kw)
+
+        loop_thread = threading.get_ident()
+        with patch("importlib.import_module", recording), patch(
+            "kiro_crew.connections.mint.grant_observed", AsyncMock(return_value=True)
+        ):
+            # `patch` resolves its own target by importing that module on THIS
+            # thread, through the hook just installed. Discard those so only the
+            # call under test is measured.
+            threads.clear()
+            assert await _runtime_grant_present("https://example.com/mcp", "remote") is True
+
+        assert threads, "the mint module load was not observed at all"
+        assert loop_thread not in threads, (
+            "the deferred import ran on the event loop thread; offload it via asyncio.to_thread"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_re_probe_does_not_inherit_the_previous_endpoints_challenge(self) -> None:
+        """Authorization evidence is per-probe, never carried forward.
+
+        The probe cache is keyed by NAME and ``list_servers`` rehydrates these
+        fields onto the row before a re-probe, so a server whose url was edited
+        arrives carrying the OLD endpoint's verdict. A probe that only ever SETS
+        the flags would keep reporting "Sign-in required" for an endpoint that
+        never asked for one.
+        """
+        server = McpServerInfo(
+            name="remote",
+            url="https://example.com/mcp",
+            auth_challenge=True,
+            auth_grant_present=True,
+        )
+
+        resp = MagicMock()
+        resp.status = 401
+        resp.headers = {}  # a bare 401: no challenge this time
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("kiro_crew.mcp_discovery.aiohttp.ClientSession", return_value=mock_session):
+            result = await _probe_remote(server)
+
+        assert result.status == "needs_auth"
+        assert result.auth_challenge is False
+        assert result.auth_grant_present is False
+        assert "authChallenge" not in result.to_dict()
+
+    @pytest.mark.asyncio
+    async def test_a_credential_bearing_url_never_reaches_the_log(self, caplog) -> None:
+        """The grant lookup runs for ANY url a user typed, so it must not log one.
+
+        A custom endpoint can carry a credential in its userinfo or query string.
+        The probe's own failure path therefore names the server, never the url —
+        this line lands in gateway.log, which is not a credential store.
+        """
+        from kiro_crew.mcp_discovery import _runtime_grant_present
+
+        secret_url = "https://user:sup3r-secret@mcp.example.com/mcp?token=abcd1234"
+
+        with patch(
+            "kiro_crew.connections.mint.grant_observed",
+            AsyncMock(side_effect=OSError("cache home unreadable")),
+        ):
+            with caplog.at_level(logging.DEBUG, logger="kiro_crew.mcp_discovery"):
+                present = await _runtime_grant_present(secret_url, "higgsfield")
+
+        assert present is False
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        assert "sup3r-secret" not in blob
+        assert "abcd1234" not in blob
+        assert "mcp.example.com" not in blob
+        # The server name is what makes the line diagnosable at all.
+        assert "higgsfield" in blob
 
     @pytest.mark.asyncio
     async def test_probe_remote_connection_error(self) -> None:

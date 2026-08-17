@@ -9458,7 +9458,10 @@
         "undo": "Annulla",
         "uninstall": "Disinstalla",
         "unknown": "Sconosciuto",
-        "declared": "Dichiarato"
+        "declared": "Dichiarato",
+        "sign_in_required": "Accesso richiesto",
+        "sign_in_required_help": "Questo server usa OAuth e nessuno ha ancora effettuato l’accesso. Apri una sessione di chat e invia un messaggio: Kiro CLI mostra il link di approvazione all’avvio della sessione.",
+        "oauth_not_a_static_token": "Questo server accede tramite OAuth, quindi un header Authorization statico non è sufficiente. Rimuovi l’header, poi accedi da una sessione di chat."
       },
       "memoryGraphTab": {
         "all_count": "Tutti ({{count}})",

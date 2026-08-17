@@ -9458,7 +9458,10 @@
         "undo": "Deshacer",
         "uninstall": "Desinstalar",
         "unknown": "Desconocido",
-        "declared": "Declarado"
+        "declared": "Declarado",
+        "sign_in_required": "Inicio de sesión necesario",
+        "sign_in_required_help": "Este servidor usa OAuth y todavía nadie ha iniciado sesión. Abre una sesión de chat y envía un mensaje: Kiro CLI mostrará el enlace de aprobación al iniciarse la sesión.",
+        "oauth_not_a_static_token": "Este servidor inicia sesión con OAuth, por lo que una cabecera Authorization estática no le sirve. Quita la cabecera y luego inicia sesión desde una sesión de chat."
       },
       "memoryGraphTab": {
         "all_count": "Todos ({{count}})",

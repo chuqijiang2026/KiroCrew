@@ -9458,7 +9458,10 @@
         "undo": "Annuler",
         "uninstall": "Désinstaller",
         "unknown": "Inconnu",
-        "declared": "Déclaré"
+        "declared": "Déclaré",
+        "sign_in_required": "Connexion requise",
+        "sign_in_required_help": "Ce serveur utilise OAuth et personne ne s’est encore connecté. Ouvrez une session de chat et envoyez un message : Kiro CLI affiche le lien d’approbation au démarrage de la session.",
+        "oauth_not_a_static_token": "Ce serveur se connecte via OAuth ; un en-tête Authorization statique ne peut pas lui suffire. Supprimez l’en-tête, puis connectez-vous depuis une session de chat."
       },
       "memoryGraphTab": {
         "all_count": "Tous ({{count}})",

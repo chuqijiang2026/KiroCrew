@@ -178,7 +178,7 @@ def _acp_client_factory() -> Any:
     return AcpClient
 
 
-async def _grant_observed(mcp_url: str) -> bool:
+async def grant_observed(mcp_url: str) -> bool:
     """:func:`grant_present` off the loop, SEL-audited when a grant is observed.
 
     Audited on the TRUE result only, and deliberately NOT once per stat. The
@@ -205,9 +205,13 @@ async def _grant_observed(mcp_url: str) -> bool:
             _hooks.emit_internal_read_audit, _GRANT_PRESENCE_READ_ID, "success"
         )
         if not recorded:
+            # The cache key, never the url: a caller-supplied endpoint can carry a
+            # credential in userinfo or a query string, and this line lands in
+            # gateway.log. The key is a sha256 and is also the more useful handle
+            # — it names the artifact pair on disk that the lookup consulted.
             logger.warning(
-                "grant-presence audit for %r could not be recorded; proceeding unaudited",
-                mcp_url,
+                "grant-presence audit for key %s could not be recorded; proceeding unaudited",
+                grant_key(mcp_url),
             )
     return present
 
@@ -540,7 +544,7 @@ async def _mint_watcher(slug: str, mcp_url: str, token: str) -> None:
         deadline = time.monotonic() + _MINT_TTL_SECONDS
         while time.monotonic() < deadline:
             await asyncio.sleep(_MINT_GRANT_POLL_SECONDS)
-            if await _grant_observed(mcp_url):
+            if await grant_observed(mcp_url):
                 doomed: MintState | None = None
                 async with _mints_lock:
                     entry = _mints.get(slug)
@@ -659,7 +663,7 @@ async def start_oauth_mint(
     # aged orphans. Off-loop: it reads and rewrites the manifest, and may unlink.
     await asyncio.to_thread(_sweep_mint_specs)
 
-    if await _grant_observed(mcp_url):
+    if await grant_observed(mcp_url):
         # Consent already exists (a reconnect): no URL is needed.
         async with _mints_lock:
             if _mints.get(slug, {}).get("token") == my_token:

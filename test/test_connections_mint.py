@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import subprocess
@@ -1186,6 +1187,32 @@ async def test_an_unrecordable_audit_does_not_withhold_the_grant(
 
     assert _state_only(mint.pending_mint_for("notion")) == {"state": "granted"}
     assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_unaudited_warning_names_the_key_not_the_url(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """This warning lands in gateway.log, which is not a credential store.
+
+    The lookup is reachable for ANY endpoint a user configured, not just a vetted
+    registry one, so the url can carry a credential in its userinfo or query
+    string. The sha256 cache key identifies the artifacts consulted without
+    carrying anything back out.
+    """
+    secret_url = "https://user:sup3r-secret@mcp.example.com/mcp?token=abcd1234"
+    _audit_calls_recorded(monkeypatch, recorded=False)
+    _write_paired_grant_artifacts(secret_url)
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.connections.mint"):
+        assert await mint.grant_observed(secret_url) is True
+
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert "proceeding unaudited" in blob, "the fail-open warning must still be emitted"
+    assert "sup3r-secret" not in blob
+    assert "abcd1234" not in blob
+    assert "mcp.example.com" not in blob
+    assert mint.grant_key(secret_url) in blob
 
 
 # ── every OTHER filesystem touch stays off the event loop too ──
