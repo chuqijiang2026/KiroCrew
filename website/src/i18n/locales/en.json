@@ -5401,6 +5401,7 @@
       "agent_selector": "Agent selector",
       "chat_messages": "Chat messages",
       "continue_a_previous_chat": "Continue a previous chat?",
+      "could_not_continue": "Couldn't continue",
       "could_not_set_the_agent_default_model": "Could not set the agent's default model",
       "dismiss_error": "Dismiss error",
       "dismiss_upload_error": "Dismiss upload error",
