@@ -371,3 +371,34 @@ describe('dashboardSlice', () => {
     })
   })
 })
+
+describe('dashboardSlice per-slot sub-agent teardown', () => {
+  const seeded = () => {
+    const base = reducer(undefined, { type: '@@INIT' })
+    return {
+      ...base,
+      slots: [{ key: 'chat-1', messages: 0, running: false }, { key: 'chat-2', messages: 0, running: false }] as ChatSlot[],
+      subagentRunning: { 'chat-1': 1, 'chat-2': 2 },
+      subagentDetails: { 'chat-1': [], 'chat-2': [] },
+      subagentText: { 'chat-1': {}, 'chat-2': {} },
+    }
+  }
+
+  it('drops the removed slot from all three sub-agent maps', () => {
+    const next = reducer(seeded(), removeSlotOptimistic('chat-2'))
+    expect(next.subagentRunning['chat-2']).toBeUndefined()
+    expect(next.subagentDetails['chat-2']).toBeUndefined()
+    expect(next.subagentText['chat-2']).toBeUndefined()
+    // The surviving slot keeps its state.
+    expect(next.subagentRunning['chat-1']).toBe(1)
+  })
+
+  it('drops a slot the authoritative list no longer carries', () => {
+    const payload = [{ key: 'chat-1', messages: 0, running: false }] as ChatSlot[]
+    const next = reducer(seeded(), { type: fetchSlots.fulfilled.type, payload })
+    expect(next.subagentRunning['chat-2']).toBeUndefined()
+    expect(next.subagentDetails['chat-2']).toBeUndefined()
+    expect(next.subagentText['chat-2']).toBeUndefined()
+    expect(next.subagentRunning['chat-1']).toBe(1)
+  })
+})

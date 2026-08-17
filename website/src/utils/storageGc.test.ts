@@ -177,16 +177,29 @@ describe('gcSessionStorage', () => {
     expect(localStorage.getItem(`${HEIGHTS}chat-1-1`)).toBe('{}')
   })
 
-  it('matches on prefix, so a longer sibling key is also removed', () => {
-    // `startsWith(prefix + sessionKey)` is a PREFIX test, not equality: a
-    // session id that is a prefix of another id collects the other one's keys
-    // too. Pinned so the blast radius is known rather than discovered.
+  it('stops at a boundary, so a longer sibling key survives', () => {
+    // The session id has to end where the key ends or at a ':' delimiter.
+    // Without that boundary, deleting a slot whose id prefixes a live
+    // sibling's id takes the sibling's state with it.
     localStorage.setItem(`${HEIGHTS}chat-1-1`, '{}')
     localStorage.setItem(`${HEIGHTS}chat-1-10`, '{}')
 
     gcSessionStorage('chat-1-1')
 
     expect(localStorage.getItem(`${HEIGHTS}chat-1-1`)).toBeNull()
-    expect(localStorage.getItem(`${HEIGHTS}chat-1-10`)).toBeNull()
+    expect(localStorage.getItem(`${HEIGHTS}chat-1-10`)).toBe('{}')
+  })
+
+  it('removes a per-slot send-mode preference without touching a sibling', () => {
+    localStorage.setItem('mc-busy-send-mode:foo', 'queue')
+    localStorage.setItem('mc-busy-send-mode:foobar', 'steer')
+    localStorage.setItem('mc-busy-send-mode:no-slot', 'steer')
+
+    gcSessionStorage('foo')
+
+    expect(localStorage.getItem('mc-busy-send-mode:foo')).toBeNull()
+    expect(localStorage.getItem('mc-busy-send-mode:foobar')).toBe('steer')
+    // The slot-less sentinel belongs to no session.
+    expect(localStorage.getItem('mc-busy-send-mode:no-slot')).toBe('steer')
   })
 })

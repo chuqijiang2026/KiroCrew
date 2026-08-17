@@ -26,7 +26,13 @@ const SESSION_PREFIXES = [
   'mc-webpreview-url:',
   'mc-webpreview-pending:',
   'mc-webpreview-applied:',
+  'mc-busy-send-mode:',
 ] as const
+
+/** Session ids that belong to no slot and must survive the orphan sweep.
+ *  Slot-less consumers of a per-slot preference park it under this reserved id,
+ *  so it is live for as long as the origin is. */
+const RESERVED_SESSION_IDS: ReadonlySet<string> = new Set(['no-slot'])
 
 /**
  * Remove localStorage keys belonging to sessions not in `liveSessionIds`.
@@ -46,7 +52,7 @@ export function gcOrphanedStorage(liveSessionIds: Set<string>): number {
       if (key.startsWith(prefix)) {
         // Extract the session ID: everything after the prefix, before any further ':'
         const sessionId = key.slice(prefix.length).split(':')[0]
-        if (sessionId && !liveSessionIds.has(sessionId)) {
+        if (sessionId && !RESERVED_SESSION_IDS.has(sessionId) && !liveSessionIds.has(sessionId)) {
           doomed.push(key)
         }
         break
@@ -74,7 +80,14 @@ export function gcSessionStorage(sessionKey: string): void {
     const key = localStorage.key(i)
     if (!key) continue
     for (const prefix of SESSION_PREFIXES) {
-      if (key.startsWith(prefix + sessionKey)) {
+      // The session id must end where the key ends or at a ':' delimiter.
+      // A bare prefix test would let deleting `foo` also remove `foobar`'s
+      // keys, so a departing slot would take a live sibling's state with it.
+      // Residual: a slot id that itself contains ':' stays ambiguous against a
+      // sibling extending it at a delimiter — the same limitation the colon
+      // convention already carries on the orphan sweep.
+      const scoped = prefix + sessionKey
+      if (key === scoped || key.startsWith(`${scoped}:`)) {
         doomed.push(key)
         break
       }
