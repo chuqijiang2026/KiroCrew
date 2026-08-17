@@ -36,6 +36,16 @@ export default defineConfig({
     // assertions. Declaring en-US here makes that an explicit dependency
     // instead of an accident of the runner's environment.
     locale: 'en-US',
+    // These specs assert BEHAVIOUR, not motion, so take the app's own
+    // reduced-motion path: `src/index.css` zeroes `animation-duration` to
+    // 0.01ms under this media query, which makes every overlay's enter/exit
+    // settle within a frame. Without it a spec that opens a menu and clicks a
+    // row races the mount animation — a race `ops-mission-control.spec.ts`
+    // already had to work around per-spec — and Radix `Presence` also holds a
+    // CLOSING overlay in the DOM for the length of its exit animation, so a
+    // click aimed at what it covered can land on the overlay instead. Motion
+    // is verified by recordings, not here.
+    reducedMotion: 'reduce',
     trace: 'on-first-retry',
     video: process.env.PLAYWRIGHT_VIDEO === '1' ? 'on' : 'off',
     navigationTimeout: 10000, // 10 second navigation timeout
