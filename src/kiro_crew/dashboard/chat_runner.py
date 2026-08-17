@@ -176,6 +176,7 @@ from kiro_crew.members import record_activity
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
 from kiro_crew.messaging.renderer import chunk_text
+from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform import redact_via_context
 from kiro_crew.providers.acp import is_claude_backend
@@ -6467,6 +6468,27 @@ async def _run_chat(
                     elapsed_ms=_turn_elapsed_ms,
                     exhausted=_turn_exhausted,
                 )
+                if "timeout" in (event.stop_reason or ""):
+                    # Hang-resilience series: attribute the CAUSE of a turn
+                    # timeout (the 2h-ceiling hang class). Both attrs are
+                    # booleans read defensively from live state — the inner
+                    # client may be an AcpClient (flag on itself) or an
+                    # AcpSessionProvider (flag on its handle).
+                    _ac = slot._acp_client
+                    _awaiting = bool(
+                        getattr(_ac, "_awaiting_permission", False)
+                        or getattr(
+                            getattr(_ac, "_handle", None), "_awaiting_permission", False
+                        )
+                    )
+                    emit_counter(
+                        TURN_TIMEOUT_CAUSE,
+                        {
+                            "path": "provider_timeout",
+                            "awaiting_permission": _awaiting,
+                            "children_announced": bool(_native_tracker),
+                        },
+                    )
                 _stop_reason = event.stop_reason
                 # Recorded on the slot so post-turn consumers reached later
                 # (which do not receive the event) can tell a turn that really
@@ -7696,6 +7718,17 @@ async def _run_chat(
             slot._native_subagent_tracker = _retain_terminal_native(_native_tracker)
             slot._native_subagent_output = {}
         slot._batch_rejected = False
+        # Stash the hang-attribution snapshot BEFORE dropping the client ref:
+        # if this turn was cut by the dashboard ceiling (_bounded_turn), the
+        # done-callback (finish_turn_task) runs AFTER this finally, when
+        # _acp_client is already None — it reads these two fields to emit
+        # kirocrew.turn.timeout.cause for the ceiling path.
+        _lc = slot._acp_client
+        slot._last_turn_awaiting_permission = bool(
+            getattr(_lc, "_awaiting_permission", False)
+            or getattr(getattr(_lc, "_handle", None), "_awaiting_permission", False)
+        )
+        slot._last_turn_children_announced = bool(_native_tracker)
         # Steer handle: turn is over, drop the live client ref so a late steer
         # can't target a dead session (the route also re-checks running state).
         slot._acp_client = None
