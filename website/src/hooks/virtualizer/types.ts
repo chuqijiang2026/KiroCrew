@@ -18,6 +18,20 @@ export interface UseVirtualChatOptions<T> {
    */
   followOutput?: boolean
   /**
+   * Where the list opens when there is no saved scroll anchor to restore.
+   * `'bottom'` (default) is the chat contract: slot entry pins to the tail
+   * and the initial mount window is the LAST items. `'top'` is the
+   * list/gallery contract: open at the head with the FIRST items mounted.
+   *
+   * `'top'` matters beyond the landing position: opening at the tail places
+   * every not-yet-measured row ABOVE the viewport, so each measurement that
+   * lands must compensate scrollTop, and with many estimate-to-real
+   * corrections in flight the repeated compensation writes read as flicker.
+   * At the head the unmeasured rows are all BELOW the viewport — a
+   * measurement only grows the bottom spacer, which is invisible.
+   */
+  initialPlacement?: 'top' | 'bottom'
+  /**
    * Threshold in pixels from the bottom below which `isAtBottom` becomes
    * true. Default: 100. The same threshold gates the follow-output
    * auto-pin so callers can tune sensitivity.

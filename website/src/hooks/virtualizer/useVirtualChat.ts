@@ -212,6 +212,7 @@ export function useVirtualChat<T>(
     estimatedHeight = DEFAULT_ESTIMATED,
     overscan = DEFAULT_OVERSCAN,
     followOutput = true,
+    initialPlacement = 'bottom',
     bottomThreshold = DEFAULT_BOTTOM_THRESHOLD,
     isSticky,
     externalScrollerRef,
@@ -379,6 +380,7 @@ export function useVirtualChat<T>(
   // pin runs before the tail items have rendered.
   const [windowRange, setWindowRange] = useState<{ start: number; end: number }>(() => {
     const tailSize = Math.min(itemCount, overscan + 1)
+    if (initialPlacement === 'top') return { start: 0, end: tailSize }
     return { start: Math.max(0, itemCount - tailSize), end: itemCount }
   })
   // Live mirror of windowRange for imperative reads (debug probe).
@@ -447,7 +449,11 @@ export function useVirtualChat<T>(
     const prevSession = sessionIdRef.current
     sessionIdRef.current = sessionId
     const tailSize = Math.min(itemCount, overscan + 1)
-    setWindowRange({ start: Math.max(0, itemCount - tailSize), end: itemCount })
+    setWindowRange(
+      initialPlacement === 'top'
+        ? { start: 0, end: tailSize }
+        : { start: Math.max(0, itemCount - tailSize), end: itemCount },
+    )
     lastWriteTopRef.current = -1
     setIsAtBottom(true)
     // A pending debounced save belongs to the OUTGOING session: flush it NOW,
@@ -1441,8 +1447,21 @@ export function useVirtualChat<T>(
         return restoreAnchor(idx, anchor)
       }
       // Anchored row not found — re-arm follow (the sentinel released it in
-      // anticipation of a restore) and take the default bottom-pin path.
+      // anticipation of a restore) and take the default placement path.
       stickRef.current = followOutput
+    }
+    if (initialPlacement === 'top') {
+      // Head placement: a fresh scroller already sits at 0, but an INHERITED
+      // one (externalScrollerRef pointing at a page column that outlives this
+      // hook) can carry leftover scrollTop from whatever it showed before.
+      // Write 0 explicitly — accounted as 'pin' so the follow guard reads the
+      // resulting scroll event as ours. No second-frame write is needed: at
+      // the head there is nothing above the viewport to re-clamp against.
+      if (itemCount === 0) return // wait for content; effect re-runs when items arrive
+      slotPinDoneRef.current = sessionId
+      const el = scrollerRef.current
+      if (el && el.scrollTop !== 0) writeScrollTop(el, 0, 'auto', 'pin')
+      return
     }
     forcePin()
     if (itemCount === 0) return  // wait for content; effect re-runs when items arrive

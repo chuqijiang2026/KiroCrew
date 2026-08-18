@@ -1054,3 +1054,62 @@ describe('useVirtualChat: scroll-anchor preservation (T4/#5)', () => {
     }
   })
 })
+
+// Feature: chat-virtualizer — initialPlacement: 'top' (the list/gallery contract).
+//
+// The default is the chat contract: tail window + a slot-entry force-pin to the
+// bottom. A gallery consuming this hook opens at the HEAD instead — and beyond
+// the landing position this is the flicker fix: at the tail every unmeasured
+// row is ABOVE the viewport, so each measurement forces a scrollTop
+// compensation write; at the head they are all below, and corrections land in
+// the bottom spacer invisibly.
+describe('initialPlacement: top', () => {
+  const geom = { scrollTop: 0, scrollHeight: 4000, clientHeight: 800 }
+
+  function renderTop(items: Item[], extra?: Partial<UseVirtualChatOptions<Item>>) {
+    const { el, state } = makeScroller({ ...geom, ...((extra as { geom?: Geom })?.geom ?? {}) })
+    const ref: RefObject<HTMLDivElement | null> = { current: el }
+    const view = renderHook((props: UseVirtualChatOptions<Item>) => useVirtualChat<Item>(props), {
+      initialProps: {
+        items,
+        sessionId: 'gallery-top',
+        getKey,
+        externalScrollerRef: ref,
+        followOutput: false,
+        initialPlacement: 'top',
+        ...extra,
+      } as UseVirtualChatOptions<Item>,
+    })
+    return { view, el, state }
+  }
+
+  it('mounts the HEAD window, not the tail', () => {
+    const { view } = renderTop(mkItems(40))
+    const mounted = view.result.current.virtualItems.filter((v) => v.mounted).map((v) => v.index)
+    expect(mounted).toContain(0)
+    expect(mounted).not.toContain(39)
+    // Nothing above the first mounted row — measurements can only grow the
+    // bottom spacer, which is what makes mount quiet.
+    expect(view.result.current.offsetBefore).toBe(0)
+  })
+
+  it('slot entry lands at scrollTop 0 even on an inherited scroller, and does not bottom-pin', () => {
+    // The page-column scroller outlives the gallery view, so it can carry
+    // leftover scrollTop from whatever it showed before.
+    const { state } = renderTop(mkItems(40), { geom: { scrollTop: 500, scrollHeight: 4000, clientHeight: 800 } } as never)
+    expect(state.scrollTop).toBe(0)
+  })
+
+  it('default placement still takes the chat contract (tail window)', () => {
+    const { el, state } = makeScroller(geom)
+    const ref: RefObject<HTMLDivElement | null> = { current: el }
+    const { result } = renderHook(() =>
+      useVirtualChat<Item>({ items: mkItems(40), sessionId: 'chat-default', getKey, externalScrollerRef: ref }),
+    )
+    const mounted = result.current.virtualItems.filter((v) => v.mounted).map((v) => v.index)
+    expect(mounted).toContain(39)
+    expect(mounted).not.toContain(0)
+    // Slot entry force-pinned to the bottom.
+    expect(state.scrollTop).toBe(geom.scrollHeight - geom.clientHeight)
+  })
+})
