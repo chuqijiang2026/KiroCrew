@@ -738,12 +738,13 @@ export default function SchedulePage() {
                       own surface): the default cell background is transparent and
                       the scrolling columns would show through. Sticky changes
                       paint position, not column width, so the `w-[176px]`
-                      contract above still holds. The pinned edge carries no
-                      static border: the seam cue is the measured gradient
-                      painted after the table, shown only while the scroller
-                      actually hides columns, so a full-width desktop table is
-                      byte-identical to the unpinned rendering at rest. */}
-                  <TableHead className="sticky right-0 w-[176px] bg-card">{i18nT('pages.schedulePage.actions')}</TableHead>
+                      contract above still holds. The seam is TWO parts, both
+                      gated on the measured overflow flag so a full-width table
+                      renders neither: this cell's `border-l` (legible over
+                      whitespace, where a fade into the same surface colour
+                      vanishes) and the gradient painted after the table (says
+                      "content continues", which a 1px rule alone does not). */}
+                  <TableHead className={`sticky right-0 w-[176px] bg-card ${jobsTableEdges.right ? 'border-l border-border' : ''}`}>{i18nT('pages.schedulePage.actions')}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>{jobs.length === 0
@@ -823,7 +824,7 @@ export default function SchedulePage() {
                     inside the stacking context every sticky cell creates):
                     `--accent-subtle` is translucent, so composited over
                     `bg-card` it matches the rest of the row exactly. */}
-                <TableCell className="sticky right-0 whitespace-nowrap bg-card" onClick={e => e.stopPropagation()}>
+                <TableCell className={`sticky right-0 whitespace-nowrap bg-card ${jobsTableEdges.right ? 'border-l border-border' : ''}`} onClick={e => e.stopPropagation()}>
                   <div aria-hidden className={`absolute inset-0 -z-10 transition-colors group-hover/jobrow:bg-bg-hover ${selected?.id === j.id ? 'bg-accent-subtle' : ''} ${selectedIds.has(j.id) ? 'bg-accent-subtle/60' : ''}`} />
                   <div className="flex items-center gap-1.5">
                     {j.is_running
