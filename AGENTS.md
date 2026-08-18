@@ -227,6 +227,58 @@ judgment half is the `harness-parity` rule in `AUTOSDE.yaml`.
 Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `ci`, `build`, `revert`.
 One logical change per commit.
 
+## Release Changelog
+
+`CHANGELOG.md` is written **only when a version is bumped**, and everything
+already in it is immutable. Enforced by the `changelog-is-written-at-version-bump-only`
+rule in `AUTOSDE.yaml`; the parser that renders it is `src/kiro_crew/changelog.py`.
+
+- **Your feature PR does not touch `CHANGELOG.md`.** The release PR writes the
+  section covering everything that shipped. A per-PR changelog line is how the
+  file grows into something nobody reads, and how it acquires an `## [Unreleased]`
+  section that then has to be untangled at release time. The commit subject is
+  the record until a bump names it.
+- **There is no `## [Unreleased]` section.** To see what is pending, read
+  `git log --oneline <last-tag>..HEAD`.
+- **One section per release, newest first**, headed exactly
+  `## [X.Y.Z] — YYYY-MM-DD`. Never a prerelease spelling: `0.3.0-insider.9` and
+  `0.3.0-rc.2` are drafts of `0.3.0`, are folded onto it by the parser, and must
+  not get their own heading.
+- **Never delete or edit a shipped section.** A release PR prepends one section
+  and leaves every earlier one byte-identical. This has already gone wrong once:
+  a section was *replaced* rather than prepended and 322 lines of released
+  history went with it, which no test caught and a user reported as an empty
+  Releases page.
+
+Format, which the `[0.2.0]` section is the reference for:
+
+- A two-to-four line opening paragraph naming the release's theme. Not a count of
+  commits.
+- Then `###` subsections grouped by **what the reader gets**, ordered most
+  interesting first. Never group by commit type: nobody opens a changelog looking
+  for the refactors.
+- Each bullet is `- **Short name** — what the user can now do`, one or two lines,
+  in plain language and the present tense.
+- Describe the capability, not the mechanism. No commit hashes, PR numbers, file
+  paths, module names, or internal vocabulary.
+- **Never generate the section from a commit dump.** A list of commit subjects, a
+  `Bug Fixes (88 total)` header, or a trailing `and 65 more (see commit log)` is
+  the failure mode this format exists to prevent. Fixes that are invisible to the
+  reader are simply left out; fixes that are visible are described as an outcome
+  and folded into the subsection they belong to.
+- **A closing `### Notable fixes` section is allowed, and is not a commit dump.**
+  It exists so a reader can check whether their particular annoyance is gone. It
+  is a curated list of individually-named, user-observable outcomes, one line
+  each, written as what is now true ("Teams retries a rate-limited message
+  instead of dropping it"). What makes it a dump instead is a total count, a
+  bare commit subject, a scope prefix, or a "and N more" tail — so it carries
+  none of those, and a fix nobody would notice does not earn a line.
+- Keep the showcase body no longer than the previous release's showcase body.
+  Length is what stops it being read, so a bigger release means harder editing,
+  not more lines. The `### Notable fixes` tail is counted separately: it is
+  scanned for one line, not read top to bottom, so it does not spend the same
+  budget.
+
 ## The gate before you commit
 
 ```bash
