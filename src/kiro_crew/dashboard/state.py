@@ -305,6 +305,16 @@ _READ_ONLY_BASH_PREFIXES: tuple[str, ...] = (
     "javac -version",
 )
 
+# These must match EXACTLY (no additional arguments allowed). Prevents
+# interpreters from passing trailing flags through: e.g.
+# "node --help --require /tmp/payload.js" must NOT match.
+_READ_ONLY_BASH_EXACT: tuple[str, ...] = (
+    "brazil-build --help",
+    "node --help",
+    "java --help",
+    "javac --help",
+)
+
 _READ_ONLY_PIPE_RE = re.compile(
     r"^\s*(grep|egrep|fgrep|head|tail|wc|sort|uniq|cut|less|more|cat)\b"
 )
@@ -349,8 +359,7 @@ def _classify_bash(cmd: str) -> str:
             return "unsafe shell pattern"
         first = pipe_parts[0].strip().lower()
         if not (
-            first.endswith("--help")
-            or first.endswith("--version")
+            first in _READ_ONLY_BASH_EXACT
             or any(first == p or first.startswith(p + " ") for p in _READ_ONLY_BASH_PREFIXES)
         ):
             base = first.split()[0] if first.split() else first
