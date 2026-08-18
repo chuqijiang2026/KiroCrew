@@ -667,6 +667,198 @@ All notable changes to KiroCrew are documented in this file.
   the app's manifest (or re-import it), then reinstall the app to the workspace
   and copy the new bot token. (#3206)
 
+## [0.3.0] — 2026-08-17
+
+The agent gained its own browser and can now run several threads of your work at
+once. Sessions explain themselves when you come back to them, Linux ARM64 and
+Windows join the first-class builds, and you can talk to it by holding a key.
+
+### Run several threads at once
+
+- **Crew Mode** — Send the next message without waiting for the last one. Topics
+  are dispatched to parallel sub-sessions and answers arrive independently, so
+  one chat advances several pieces of work at the same time.
+- **Session summaries** — A side-panel tab says what each thread of a session was
+  trying to do and where it landed, with anything still open hoisted to the top.
+  Old sessions can be summarised on demand. Opt-in, with its token cost stated.
+- **Sessions resume instantly** — An earlier chat loads in the background while
+  you read it, so the first message sends immediately instead of waiting on a
+  cold start.
+- **You can watch the context fill up** — The composer reports consumption as a
+  percentage and a token count, so compaction stops arriving as a surprise.
+- **A wedged turn recovers itself** — A stuck tool, a dead process, or a frozen
+  model call is detected and nudged back to life instead of hanging silently.
+- **Pinned messages, and a session that admits it needs you** — Pin messages for
+  reference; a session waiting on your answer says so instead of looking idle.
+
+### The agent gets its own browser
+
+- **The Browser panel is the browser** — The agent drives the dashboard's own
+  side panel directly: navigate, click, type, screenshot. Browsing happens where
+  you are already looking, with no second window and no security prompt. The
+  Playwright CLI remains for remote sessions and for a browser you are already
+  logged into.
+- **Nothing to install first** — Browsing no longer needs Node or npm on the
+  machine. A private, verified copy is fetched for you, so a locked-down laptop
+  is one click from a working browser rather than a dead end.
+- **Computer Use is offered only where it works** — Native desktop automation
+  appears on macOS, instead of everywhere and then failing.
+
+### Two new apps, and a store worth browsing
+
+- **Personal Shopper** — Researches real stores on your behalf and recommends
+  something only when buying actually helps. It diagnoses the problem first, and
+  never touches a cart.
+- **Issue Radar Crews** — Put autonomous workers on claimed issues. Each crew
+  takes an issue into its own worktree, posts progress to a public claim ledger,
+  and pushes a pull request: hands-free from triage to code review.
+- **A curated App Store** — Discover renders editorial spotlights, themed
+  collections, and category rails with curator artwork, not one flat list.
+- **Meetings keeps the transcript** — Stored and shown beside the agent's notes,
+  and it survives a reload.
+- **Ask Code Review Sage why** — The reviewer stays available after it posts, so
+  you can question a finding instead of starting over.
+- **Research Lab and Spec Builder pick their own model** — Instead of always
+  falling through to your chat default.
+- **A public deploy asks first** — Publishing an artifact publicly requires an
+  explicit acknowledgement, and an operator can close the path entirely.
+
+### Reach it from anywhere
+
+- **Linux ARM64** — A native aarch64 desktop build, published with an
+  architecture check so nobody downloads the wrong one.
+- **Windows is a first-class build** — The same targets as macOS and Linux, with
+  its own install guide.
+- **Summon it from any app** — A system-wide hotkey (Cmd+Shift+K on macOS,
+  Alt+Shift+K elsewhere) raises the dashboard. Reconfigurable, or off.
+- **Change release channel without reinstalling** — Move between Stable, Insider,
+  and Nightly from About, and the gateway restarts in place after an update.
+- **Publish it on your tailnet** — `kirocrew tailnet up` puts the dashboard on
+  your Tailscale network, reachable from your other devices.
+- **Launch a cloud crew from the dashboard** — Remote EC2 provisioning, device
+  sign-in included, as a restartable job rather than a CLI session you must not
+  close.
+- **Keep on Top** — Pin the window above everything else, remembered across
+  restarts.
+
+### Voice, terminal, and files
+
+- **Push to talk** — Hold a key to dictate, or tap to latch it on. The key, the
+  mode, and a live test strip are in Settings.
+- **The terminal docks where you want it** — Bottom or right, opening in the
+  session's own project directory, with your preferred shell.
+- **Images are kept as artifacts** — Screenshots and diagrams the agent produces
+  are preserved with a gallery, a detail page, and metadata.
+- **Reveal a file on disk** — Jump from the file viewer to its folder in Finder
+  or Explorer.
+
+### Channels
+
+- **Discord and Telegram threads stay alive** — A reply sent from the dashboard
+  is relayed back into the conversation it came from.
+- **Telegram has a real command menu** — Type `/` for autocomplete, switch models
+  with inline buttons, and toggle auto-approve without leaving the chat.
+- **WeChat accepts attachments** — Photos, voice memos, and documents reach the
+  agent instead of being dropped.
+- **A channel can file its own sessions** — Point a channel at a named sidebar
+  folder and its conversations group themselves there.
+
+### Tools and connections
+
+- **Connecting takes one click** — Connect mints the provider's approval link
+  immediately and consent finishes on the card, instead of waiting for a later
+  chat to trigger the challenge.
+- **Pooling works itself out** — Kiro Crew probes which MCP servers can safely
+  share a process. A per-server choice replaces the old global switch and its
+  guesswork.
+- **Per-agent tool sets** — Assign servers to particular agents so each sees its
+  own surface without editing global config.
+- **Tune how tools defer** — Decide how aggressively Tool Search hides tools
+  until they are needed, trading context for immediacy.
+
+### Autonomy with a governor
+
+- **It knows when the machine is full** — Scheduled jobs defer and new subagents
+  are refused when memory is critically low, and the header shows the posture so
+  you know before heavy work fails.
+- **Each job sets its own time budget** — Up to 24 hours, replacing one fixed
+  thirty-minute cap for every job.
+- **Read a script job without a terminal** — Its Python source is shown,
+  highlighted and read-only, in the job's detail view.
+- **Monitoring keeps its schedule** — Talking to a session mid-loop no longer
+  restarts the countdown, so checks land when they were meant to.
+- **A blip is not a failure** — Transient throttles and server errors retry
+  instead of counting toward the auto-pause threshold.
+
+### Memory and knowledge
+
+- **Lessons surface by relevance** — Applicable older corrections stop decaying
+  out of context as the library grows.
+- **Knowledge spending is bounded, and opt-in** — A sweep budget, per-source rate
+  limits and caps, a configurable extraction model, and visible per-source cost.
+  A fresh install ingests nothing until you say so.
+
+### Security and governance
+
+- **An app sees only its own events** — Installed apps receive the event scopes
+  their manifest declares, and can no longer observe your chats, your scheduled
+  job results, or another app's activity.
+- **Scheduled jobs are re-vetted every run** — Checked against current policy
+  each time they fire rather than only when created, and a restored backup can no
+  longer smuggle shell commands past the approval system.
+- **The memory ceiling covers everything at once** — The cap applies to all
+  concurrent agents together, so many small spawns can no longer exhaust the host
+  between them.
+- **Credentials are scrubbed on the live stream** — Redaction now covers
+  real-time output as well as replayed history.
+- **A pinned policy floor cannot be lowered locally** — On a governed host the
+  policy wins over local configuration.
+- **Bring your own identity provider** — Administrators can authorise their own
+  OAuth providers by configuration, without waiting for a release.
+
+### Everywhere else
+
+- **It fits on a phone** — Every major panel collapses to a usable single pane,
+  and the software keyboard no longer covers the composer.
+- **Search your history in Chinese, Japanese, and Korean** — Text without spaces
+  between words is now searchable.
+- **Storage you can actually clear** — The session storage screen loads in
+  seconds and deletes in bulk.
+
+### Notable fixes
+
+For anyone who wants to know whether their particular annoyance is gone.
+
+- Dropping a folder into chat inserts its path instead of trying to upload it.
+- Screenshots downscale on the longest edge, so a tall page capture no longer
+  breaks the conversation it was taken in.
+- Browser setup copes with non-apt Linux, and with a Node the service's own PATH
+  does not carry.
+- Session start has its own timeout budget, so a slow MCP fleet no longer looks
+  like a hung agent.
+- A resumed session keeps its pooled MCP servers instead of quietly falling back
+  to unpooled ones.
+- Stopping a turn stops the session the turn is actually running on.
+- A stalled subagent card says how long it has been idle.
+- A long session title no longer pushes the header controls off the screen.
+- Korean joins the speech-to-text language picker, and the settings shown match
+  the provider you selected.
+- Telegram ignores a slash command aimed at a different bot in the same group.
+- Teams retries a rate-limited message instead of dropping it.
+- Discord keeps a code fence open and preserves indentation when a long reply
+  rotates across several messages.
+- Lessons keep their "not this" clause as a field of its own, and an imported
+  lesson renders as its rule rather than as raw data.
+- Memory refuses to store an empty value, and a dimension mismatch no longer
+  breaks similarity search.
+- The Knowledge page lists the files it failed on, and accepts Org Mode.
+- A scheduled job counts a delivery failure toward auto-pause, so a job that
+  never actually reaches you stops claiming success.
+- Phone-width layout fixes reach Dev Fleet, Issue Radar, the artifact panels, and
+  the app file tree.
+- The gateway stops reporting another product's memory usage as its own.
+- The Security panel is translated instead of falling back to English.
+
 ## [0.2.0] — 2026-08-09
 
 The first feature release after launch: a real browser for the agent, four new
